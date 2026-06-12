@@ -1989,24 +1989,39 @@ func (c *client) readPaginatedResultsWithValuesWithContext(ctx context.Context, 
 			break
 		}
 
+		// For GitHub Enterprise, c.bases[0] may include a path prefix like /api/v3.
+		// We need to strip that prefix from the Link header URL so that when we
+		// prepend c.bases[hostIndex] we don't duplicate it.
+		// For standard GitHub (with or without ghproxy), there is no path prefix.
+		//
 		// Example for github.com:
 		// * c.bases[0]: api.github.com
 		// * initial call: api.github.com/repos/kubernetes/kubernetes/pulls?per_page=100
 		// * next: api.github.com/repositories/22/pulls?per_page=100&page=2
 		// * in this case prefix will be empty and we're just calling the path returned by next
-		// Example for github enterprise:
+		// Example for GitHub Enterprise:
 		// * c.bases[0]: <ghe-url>/api/v3
 		// * initial call: <ghe-url>/api/v3/repos/kubernetes/kubernetes/pulls?per_page=100
 		// * next: <ghe-url>/api/v3/repositories/22/pulls?per_page=100&page=2
 		// * in this case prefix will be "/api/v3" and we will strip the prefix. If we don't do that,
 		//   the next call will go to <ghe-url>/api/v3/api/v3/repositories/22/pulls?per_page=100&page=2
-		prefix := strings.TrimSuffix(resp.Request.URL.RequestURI(), pagedPath)
+		// Example for redirect (e.g. repo rename/transfer):
+		// * initial call: api.github.com/repos/old-org/old-repo/pulls?per_page=100
+		// * resp.Request.URL after redirect: api.github.com/repos/new-org/new-repo/pulls?per_page=100
+		// * next: api.github.com/repos/new-org/new-repo/pulls?per_page=100&page=2
+		// * we must compare only Path (not full URI) because the redirect changes the response URL,
+		//   which would cause a full-URI TrimSuffix to leave prefix as the entire response URI
+		pathOnly := strings.SplitN(pagedPath, "?", 2)[0]
+		prefix := strings.TrimSuffix(resp.Request.URL.Path, pathOnly)
 
 		u, err := url.Parse(link)
 		if err != nil {
 			return fmt.Errorf("failed to parse 'next' link: %w", err)
 		}
 		pagedPath = strings.TrimPrefix(u.RequestURI(), prefix)
+		if len(pagedPath) == 0 || pagedPath[0] != '/' {
+			pagedPath = u.RequestURI()
+		}
 	}
 	return nil
 }
