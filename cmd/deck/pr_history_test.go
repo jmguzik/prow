@@ -654,7 +654,7 @@ func Test_getPRHistory(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			prHistoryURL, _ := url.Parse(tt.args.url)
-			got, err := getPRHistory(context.Background(), prHistoryURL, c, io.NewGCSOpener(fakeGCSClient), nil, nil, "github.com")
+			got, err := getPRHistory(context.Background(), prHistoryURL, c, io.NewGCSOpener(fakeGCSClient), nil, nil, "github.com", &historyBucket{})
 			if (err != nil) != tt.wantErr {
 				t.Errorf("getPRHistory() error = %v, wantErr %v", err, tt.wantErr)
 				return

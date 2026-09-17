@@ -140,6 +140,12 @@ type options struct {
 	controllerManager     prowflagutil.ControllerManagerOptions
 	dryRun                bool
 	tenantIDs             prowflagutil.Strings
+
+	historyBucketName          string
+	historyBucketBrowserPrefix string
+	historyBucketBanner        string
+	// history is derived from the three flags above by Validate.
+	history *historyBucket
 }
 
 func (o *options) Validate() error {
@@ -161,6 +167,13 @@ func (o *options) Validate() error {
 	if (o.hiddenOnly && o.showHidden) || (o.tenantIDs.Strings() != nil && (o.hiddenOnly || o.showHidden)) {
 		return errors.New("'--hidden-only', '--tenant-id', and '--show-hidden' are mutually exclusive, 'hidden-only' shows only hidden job, '--tenant-id' shows all jobs with matching ID and 'show-hidden' shows both hidden and non-hidden jobs")
 	}
+
+	history, err := parseHistoryBucket(o.historyBucketName, o.historyBucketBrowserPrefix, o.historyBucketBanner)
+	if err != nil {
+		return err
+	}
+	o.history = history
+
 	return nil
 }
 
@@ -186,6 +199,9 @@ func gatherOptions(fs *flag.FlagSet, args ...string) options {
 	fs.BoolVar(&o.allowInsecure, "allow-insecure", false, "Allows insecure requests for GitHub oauth.")
 	fs.BoolVar(&o.dryRun, "dry-run", false, "Whether or not to make mutating API calls to GitHub.")
 	fs.Var(&o.tenantIDs, "tenant-id", "The tenantID(s) used by the ProwJobs that should be displayed by this instance of Deck. This flag can be repeated.")
+	fs.StringVar(&o.historyBucketName, "history-bucket", "", "Read-only bucket holding job results that were moved out of the bucket jobs currently write to, e.g. 'gs://prow-history'. Job and PR history are merged across both buckets, but artifacts in this one are never served: Spyglass renders no lenses for them and links to --history-bucket-browser-prefix instead. The bucket does not need to appear in deck.additional_allowed_buckets.")
+	fs.StringVar(&o.historyBucketBrowserPrefix, "history-bucket-browser-prefix", "", "Prefix for the 'Artifacts' link on pages served from --history-bucket. Required when --history-bucket is set. Point it at an endpoint that enforces a login, e.g. 'https://console.cloud.google.com/storage/browser/prow-history/'.")
+	fs.StringVar(&o.historyBucketBanner, "history-bucket-banner", "", "HTML banner shown on Spyglass pages served from --history-bucket. Defaults to a generic explanation that the artifacts are archived and require signing in.")
 	o.config.AddFlags(fs)
 	o.instrumentation.AddFlags(fs)
 	o.controllerManager.TimeoutListingProwJobsDefault = 30 * time.Second
@@ -654,6 +670,14 @@ func initSpyglass(cfg config.Getter, o options, mux *http.ServeMux, ja *jobs.Job
 	if err != nil {
 		logrus.WithError(err).Fatal("Error creating opener")
 	}
+	// Everything below shares this one Opener, so wrapping it here is what keeps
+	// the history bucket's artifacts out of every response, including the
+	// caller-controlled source accepted by /spyglass/lens/.
+	opener = newGuardedOpener(opener, o.history)
+	cfg = historyAwareConfigGetter(cfg, o.history)
+	if o.history.enabled() {
+		logrus.WithField("history-bucket", o.history.name).Info("Serving job history from an additional read-only bucket; its artifacts will not be served.")
+	}
 	sg := spyglass.New(ctx, ja, cfg, opener, o.gcsCookieAuth)
 	sg.Start()
 
@@ -932,7 +956,7 @@ func handleBadge(ja *jobs.JobAgent) http.HandlerFunc {
 func handleJobHistory(o options, cfg config.Getter, opener io.Opener, log *logrus.Entry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		setHeadersNoCaching(w)
-		tmpl, err := getJobHistory(r.Context(), r.URL, cfg, opener)
+		tmpl, err := getJobHistory(r.Context(), r.URL, cfg, opener, o.history)
 		if err != nil {
 			msg := fmt.Sprintf("failed to get job history: %v", err)
 			if shouldLogHTTPErrors(err) {
@@ -958,7 +982,7 @@ func handleJobHistory(o options, cfg config.Getter, opener io.Opener, log *logru
 func handlePRHistory(o options, cfg config.Getter, opener io.Opener, gitHubClient deckGitHubClient, gitClient git.ClientFactory, log *logrus.Entry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		setHeadersNoCaching(w)
-		tmpl, err := getPRHistory(r.Context(), r.URL, cfg(), opener, gitHubClient, gitClient, o.github.Host)
+		tmpl, err := getPRHistory(r.Context(), r.URL, cfg(), opener, gitHubClient, gitClient, o.github.Host, o.history)
 		if err != nil {
 			msg := fmt.Sprintf("failed to get PR history: %v", err)
 			log.WithField("url", r.URL.String()).Info(msg)
@@ -990,6 +1014,19 @@ func handleRequestJobViews(sg *spyglass.Spyglass, cfg config.Getter, o options, 
 
 		page, err := renderSpyglass(r.Context(), sg, cfg, src, o, log)
 		if err != nil {
+			// The run lives in the history bucket rather than the one the link
+			// names. Redirect instead of rendering the archived page here, so
+			// that the address bar, the artifacts link and any reload agree on
+			// which bucket is being viewed.
+			var redirect spyglassRedirect
+			if errors.As(err, &redirect) {
+				target := path.Join("/view", redirect.target)
+				if r.URL.RawQuery != "" {
+					target += "?" + r.URL.RawQuery
+				}
+				http.Redirect(w, r, target, http.StatusFound)
+				return
+			}
 			msg := fmt.Sprintf("error rendering spyglass page: %v", err)
 			if shouldLogHTTPErrors(err) {
 				log.WithError(err).Debug(msg)
@@ -1017,14 +1054,24 @@ func renderSpyglass(ctx context.Context, sg *spyglass.Spyglass, cfg config.Gette
 	if err != nil {
 		return "", fmt.Errorf("error when resolving real path %s: %w", src, err)
 	}
-	src = realPath
+	src = o.history.keepInArchive(src, realPath)
 	artifactNames, err := sg.ListArtifacts(ctx, src)
 	if err != nil {
 		return "", fmt.Errorf("error listing artifacts: %w", err)
 	}
 	if len(artifactNames) == 0 {
+		// Links handed out before the migration still name the live bucket, but
+		// the run they point at now only exists in the archive. Probing only
+		// once the live bucket has come up empty keeps this off the hot path.
+		if target, ok := o.history.viewSource(src); ok {
+			if archived, err := sg.ListArtifacts(ctx, target); err == nil && len(archived) > 0 {
+				return "", spyglassRedirect{target: target}
+			}
+		}
 		log.Infof("found no artifacts for %s", src)
 	}
+
+	archived := o.history.sourceIsArchived(src)
 
 	regexCache := cfg().Deck.Spyglass.RegexCache
 	lensCache := map[int][]string{}
@@ -1055,6 +1102,13 @@ lensesLoop:
 
 		lensCache[i] = sets.List(matches)
 		lensIndexes = append(lensIndexes, i)
+	}
+
+	// Every lens renders by reading artifacts, which the guarded opener refuses
+	// for the archive, so a matched lens could only draw itself as an error.
+	// Drop them all and let the banner say where the content went instead.
+	if archived {
+		lensIndexes, lensCache = nil, map[int][]string{}
 	}
 
 	lensIndexes, ls := sg.Lenses(lensIndexes)
@@ -1100,8 +1154,15 @@ lensesLoop:
 	if jobPath != "" && (strings.HasPrefix(jobPath, providers.GS) || strings.HasPrefix(jobPath, providers.S3)) {
 		bucket = strings.Split(jobPath, "/")[1] // The provider (gs) will be in index 0, followed by the bucket name
 	}
-	gcswebPrefix := cfg().Deck.Spyglass.GetGCSBrowserPrefix(org, repo, bucket)
-	if gcswebPrefix != "" {
+	if archived {
+		// Deck will not proxy the archive, so this is the only way to reach
+		// these artifacts. It deliberately ignores any configured browser
+		// prefix: those point at the public bucket, which no longer holds this
+		// run, and at an endpoint that does not ask for a login.
+		if runPath, err := sg.RunPath(src); err == nil {
+			artifactsLink = o.history.artifactsLink(runPath)
+		}
+	} else if gcswebPrefix := cfg().Deck.Spyglass.GetGCSBrowserPrefix(org, repo, bucket); gcswebPrefix != "" {
 		runPath, err := sg.RunPath(src)
 		if err == nil {
 			artifactsLink = gcswebPrefix + runPath
@@ -1143,6 +1204,12 @@ lensesLoop:
 			return "", fmt.Errorf("error executing announcement template: %w", err)
 		}
 		announcement = announcementBuf.String()
+	}
+	if archived {
+		// Replaces any configured announcement rather than joining it: nothing
+		// on this page will load, and saying why is more use to the reader than
+		// whatever the global notice happens to say.
+		announcement = o.history.banner
 	}
 
 	tgLink, err := sg.TestGridLink(src)

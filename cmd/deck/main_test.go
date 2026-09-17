@@ -941,6 +941,9 @@ func Test_gatherOptions(t *testing.T) {
 				spyglassFilesLocation: "/lenses",
 				github:                ghoptions,
 				instrumentation:       flagutil.DefaultInstrumentationOptions(),
+				// Validate always parses --history-bucket; with the flag unset
+				// that yields a disabled history bucket rather than nil.
+				history: &historyBucket{},
 			}
 			if tc.expected != nil {
 				tc.expected(expected)

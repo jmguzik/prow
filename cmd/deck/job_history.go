@@ -28,6 +28,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/GoogleCloudPlatform/testgrid/metadata"
@@ -429,8 +430,83 @@ func (a uint64slice) Len() int           { return len(a) }
 func (a uint64slice) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a uint64slice) Less(i, j int) bool { return a[i] < a[j] }
 
-// Gets job history from the bucket specified in config.
-func getJobHistory(ctx context.Context, url *url.URL, cfg config.Getter, opener pkgio.Opener) (jobHistoryTemplate, error) {
+// bucketBuilds is one bucket's contribution to a merged job history page.
+type bucketBuilds struct {
+	bucket   blobStorageBucket
+	latest   uint64
+	buildIDs []uint64
+	// err is the reason this bucket contributed nothing. A bucket that simply
+	// does not know about the job is not an error for the page as a whole,
+	// which is the point of collecting these rather than returning early.
+	err error
+}
+
+// collectBuildIDs reads the latest build marker and the full build ID list for
+// root from every given bucket, in parallel. A bucket that has never seen this
+// job yields an err and no IDs; that is expected once history spans two
+// buckets, since a job created after the migration exists only in the live one
+// and a job retired before it exists only in the archive.
+func collectBuildIDs(ctx context.Context, buckets []blobStorageBucket, root string) []bucketBuilds {
+	// Don't spend an unbound amount of time finding a potentially huge history.
+	// The budget covers all buckets together, so adding the archive does not
+	// double how long a slow page can take.
+	listCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	results := make([]bucketBuilds, len(buckets))
+	var wg sync.WaitGroup
+	for i, bucket := range buckets {
+		wg.Add(1)
+		go func(i int, bucket blobStorageBucket) {
+			defer wg.Done()
+			results[i] = bucketBuilds{bucket: bucket}
+			latest, err := readLatestBuild(listCtx, bucket, root)
+			if err != nil {
+				results[i].err = fmt.Errorf("failed to locate build data in %s: %w", bucket.getName(), err)
+				// Keep going: latest-build.txt can be missing for a job whose
+				// results were archived mid-flight, while the build
+				// directories themselves are all there.
+			}
+			results[i].latest = latest
+			buildIDs, err := bucket.listBuildIDs(listCtx, root)
+			if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+				results[i].err = fmt.Errorf("failed to get build ids from %s: %w", bucket.getName(), err)
+				return
+			}
+			results[i].buildIDs = buildIDs
+			if len(buildIDs) > 0 {
+				results[i].err = nil
+			}
+		}(i, bucket)
+	}
+	wg.Wait()
+	return results
+}
+
+// mergeBuildIDs flattens per-bucket build IDs into one descending list and
+// records which bucket each ID came from. Buckets are considered in order, so
+// an ID present in more than one is attributed to the earliest: during the
+// migration window the same run can exist in both, and the live bucket is the
+// copy whose artifacts Deck can actually serve.
+func mergeBuildIDs(results []bucketBuilds) ([]uint64, map[uint64]blobStorageBucket) {
+	owner := make(map[uint64]blobStorageBucket)
+	var merged []uint64
+	for _, result := range results {
+		for _, id := range result.buildIDs {
+			if _, seen := owner[id]; seen {
+				continue
+			}
+			owner[id] = result.bucket
+			merged = append(merged, id)
+		}
+	}
+	sort.Sort(sort.Reverse(uint64slice(merged)))
+	return merged, owner
+}
+
+// Gets job history from the bucket specified in config, merged with the
+// read-only history bucket when one is configured.
+func getJobHistory(ctx context.Context, url *url.URL, cfg config.Getter, opener pkgio.Opener, history *historyBucket) (jobHistoryTemplate, error) {
 	start := time.Now()
 	tmpl := jobHistoryTemplate{}
 
@@ -447,10 +523,41 @@ func getJobHistory(ctx context.Context, url *url.URL, cfg config.Getter, opener 
 	if err != nil {
 		return tmpl, err
 	}
+	buckets := []blobStorageBucket{bucket}
+	// When the page is already pointed at the archive there is nothing to merge;
+	// merging only makes sense when looking at the bucket jobs write to now.
+	if history.enabled() && !history.matches(bucketName) {
+		archive, err := newBlobStorageBucket(history.name, history.storageProvider, cfg(), opener)
+		if err != nil {
+			return tmpl, err
+		}
+		buckets = append(buckets, archive)
+	}
+
 	tmpl.Name = root
-	latest, err := readLatestBuild(ctx, bucket, root)
-	if err != nil {
-		return tmpl, fmt.Errorf("failed to locate build data: %w", err)
+
+	results := collectBuildIDs(ctx, buckets, root)
+	buildIDs, owner := mergeBuildIDs(results)
+
+	var latest uint64
+	for _, result := range results {
+		if result.latest > latest {
+			latest = result.latest
+		}
+	}
+	if latest == emptyID && len(buildIDs) == 0 {
+		// No bucket has anything for this job, so report why the one the user
+		// asked for came up empty rather than rendering a blank page.
+		if results[0].err != nil {
+			return tmpl, fmt.Errorf("failed to locate build data: %w", results[0].err)
+		}
+		return tmpl, fmt.Errorf("failed to locate build data: no builds found in %s", bucketName)
+	}
+	if latest == emptyID {
+		// latest-build.txt is gone but the build directories survived, which is
+		// the normal state for a job whose history was archived. The newest
+		// build we found stands in for it.
+		latest = buildIDs[0]
 	}
 	if top == emptyID || top > latest {
 		top = latest
@@ -458,16 +565,6 @@ func getJobHistory(ctx context.Context, url *url.URL, cfg config.Getter, opener 
 	if top != latest {
 		tmpl.LatestLink = linkID(url, emptyID)
 	}
-
-	// Don't spend an unbound amount of time finding a potentially huge history
-	buildIDListCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	buildIDs, err := bucket.listBuildIDs(buildIDListCtx, root)
-	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
-		return tmpl, fmt.Errorf("failed to get build ids: %w", err)
-	}
-
-	sort.Sort(sort.Reverse(uint64slice(buildIDs)))
 
 	// determine which results to display on this page
 	shownIDs, firstIndex, lastIndex := cropResults(buildIDs, top)
@@ -493,7 +590,11 @@ func getJobHistory(ctx context.Context, url *url.URL, cfg config.Getter, opener 
 	// concurrently fetch data for all of the builds to be shown
 	bch := make(chan buildData)
 	for i, buildID := range shownIDs {
-		go func(i int, buildID uint64) {
+		// Each build is read from whichever bucket listed it, so a page can mix
+		// live and archived runs. The Spyglass link follows the same bucket,
+		// which is what makes an archived row land on a page that knows not to
+		// serve its artifacts.
+		go func(i int, buildID uint64, bucket blobStorageBucket) {
 			id := strconv.FormatUint(buildID, 10)
 			dir, err := bucket.getPath(ctx, root, id, "")
 			if err != nil {
@@ -518,7 +619,7 @@ func getJobHistory(ctx context.Context, url *url.URL, cfg config.Getter, opener 
 				logrus.WithError(err).Errorf("failed to get spyglass link")
 			}
 			bch <- b
-		}(i, buildID)
+		}(i, buildID, owner[buildID])
 	}
 	for range shownIDs {
 		b := <-bch

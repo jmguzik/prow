@@ -260,7 +260,55 @@ func getStorageDirsForPR(c *config.Config, gitHubClient deckGitHubClient, gitCli
 	return toSearch, nil
 }
 
-func getPRHistory(ctx context.Context, prHistoryURL *url.URL, config *config.Config, opener pkgio.Opener, gitHubClient deckGitHubClient, gitClient git.ClientFactory, githubHost string) (prHistoryTemplate, error) {
+// historyBucketKey is how the archive is keyed in the map of places to search.
+func historyBucketKey(history *historyBucket) string {
+	if !history.enabled() {
+		return ""
+	}
+	return fmt.Sprintf("%s://%s", history.storageProvider, history.name)
+}
+
+// addHistoryBucketDirs mirrors every storage path that was derived from the job
+// config into the read-only history bucket. The job config only ever names the
+// bucket jobs write to now, so without this a PR that predates the migration
+// shows no builds at all even though its results were merely moved.
+func addHistoryBucketDirs(toSearch map[string]sets.Set[string], history *historyBucket) {
+	archive := historyBucketKey(history)
+	if archive == "" {
+		return
+	}
+	paths := sets.Set[string]{}
+	for bucket, storagePaths := range toSearch {
+		if bucket == archive {
+			continue
+		}
+		paths = paths.Union(storagePaths)
+	}
+	if paths.Len() == 0 {
+		return
+	}
+	toSearch[archive] = paths.Union(toSearch[archive])
+}
+
+// searchOrder returns the buckets to search with the archive last. Map order is
+// random, and which bucket is visited first decides which copy of a run that
+// exists in both is the one displayed.
+func searchOrder(toSearch map[string]sets.Set[string], history *historyBucket) []string {
+	archive := historyBucketKey(history)
+	buckets := make([]string, 0, len(toSearch))
+	for bucket := range toSearch {
+		buckets = append(buckets, bucket)
+	}
+	sort.Slice(buckets, func(i, j int) bool {
+		if isArchive := buckets[i] == archive; isArchive != (buckets[j] == archive) {
+			return !isArchive
+		}
+		return buckets[i] < buckets[j]
+	})
+	return buckets
+}
+
+func getPRHistory(ctx context.Context, prHistoryURL *url.URL, config *config.Config, opener pkgio.Opener, gitHubClient deckGitHubClient, gitClient git.ClientFactory, githubHost string, history *historyBucket) (prHistoryTemplate, error) {
 	start := time.Now()
 	template := prHistoryTemplate{}
 
@@ -280,12 +328,24 @@ func getPRHistory(ctx context.Context, prHistoryURL *url.URL, config *config.Con
 	if err != nil {
 		return template, fmt.Errorf("failed to list directories for PR %s: %w", template.Name, err)
 	}
+	addHistoryBucketDirs(toSearch, history)
 
 	builds := []buildData{}
 	// job name -> commit hash -> list of builds
 	jobCommitBuilds := make(map[string]map[string][]buildData)
+	// job name -> index into template.Jobs. A job that ran both before and after
+	// the migration is listed by both buckets, and the rows are keyed by job
+	// name further down, so emitting it twice would duplicate every build in
+	// the table.
+	jobRows := make(map[string]int)
+	// Runs already taken from an earlier bucket, keyed by job name and build ID.
+	// A run that was copied to the archive but not yet deleted from the live
+	// bucket is listed by both, and without this it would occupy two cells in
+	// the same commit column.
+	seenBuilds := sets.Set[string]{}
 
-	for bucket, storagePaths := range toSearch {
+	for _, bucket := range searchOrder(toSearch, history) {
+		storagePaths := toSearch[bucket]
 		parsedBucket, err := url.Parse(bucket)
 		if err != nil {
 			return template, fmt.Errorf("parse bucket %s: %w", bucket, err)
@@ -304,15 +364,26 @@ func getPRHistory(ctx context.Context, prHistoryURL *url.URL, config *config.Con
 			// We assume job names to be unique, as enforced during config validation.
 			for _, jobPrefix := range jobPrefixes {
 				jobName := path.Base(jobPrefix)
-				jobData := prJobData{
-					Name: jobName,
-					Link: jobHistoryLink(storageProvider, bucketName, jobName, true),
+				link := jobHistoryLink(storageProvider, bucketName, jobName, true)
+				if _, seen := jobRows[jobName]; seen {
+					// Keep the link from the bucket that was searched first.
+					// For a job in both, that is the live one, whose job
+					// history page merges the archive back in anyway.
+					continue
 				}
-				template.Jobs = append(template.Jobs, jobData)
+				jobRows[jobName] = len(template.Jobs)
+				template.Jobs = append(template.Jobs, prJobData{Name: jobName, Link: link})
 				jobCommitBuilds[jobName] = make(map[string][]buildData)
 			}
 			jobs := listJobBuilds(ctx, bucket, jobPrefixes)
-			builds = append(builds, getPRBuildData(ctx, bucket, jobs)...)
+			for _, build := range getPRBuildData(ctx, bucket, jobs) {
+				key := build.jobName + "/" + build.ID
+				if seenBuilds.Has(key) {
+					continue
+				}
+				seenBuilds.Insert(key)
+				builds = append(builds, build)
+			}
 		}
 	}
 
